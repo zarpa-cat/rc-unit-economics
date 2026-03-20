@@ -300,5 +300,279 @@ def breakeven(
     console.print()
 
 
+@app.command()
+def cohort(
+    api_key: Annotated[str | None, typer.Option("--api-key", "-k", help="RC API key")] = None,
+    audit_db: Annotated[
+        str | None, typer.Option("--audit-db", help="Path to billing meter SQLite DB")
+    ] = None,
+    usd_per_credit: Annotated[float, typer.Option("--usd-per-credit")] = 0.001,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Show unit economics grouped by entitlement/plan cohort."""
+    from .cohort import CohortAnalyzer
+    from .rc_client import RCClient
+
+    rc_api_key = _get_api_key(api_key)
+    cost_reader = _get_cost_reader(audit_db, usd_per_credit)
+    all_costs = cost_reader.load_all() if cost_reader else []
+
+    subscriber_ids = cost_reader.known_subscriber_ids() if cost_reader else []
+    if not subscriber_ids:
+        console.print("[yellow]No subscribers found in audit DB.[/yellow]")
+        raise typer.Exit(1)
+
+    async def _fetch():
+        async with RCClient(rc_api_key) as rc:
+            revenues = []
+            for sid in subscriber_ids:
+                try:
+                    revenues.append(await rc.get_subscriber_revenue(sid))
+                except Exception:
+                    pass
+            return revenues
+
+    from .analyzer import UnitEconomicsAnalyzer
+
+    revenues = asyncio.run(_fetch())
+    analyzer = UnitEconomicsAnalyzer()
+    portfolio = analyzer.build_portfolio(revenues, all_costs)
+    ca = CohortAnalyzer()
+    cohorts = ca.group_by_cohort(portfolio)
+
+    if as_json:
+        out = {
+            cid: {
+                "subscriber_count": c.subscriber_count,
+                "profitable_count": c.profitable_count,
+                "unprofitable_count": c.unprofitable_count,
+                "total_revenue_usd": c.total_revenue_usd,
+                "total_cost_usd": c.total_cost_usd,
+                "gross_profit_usd": c.gross_profit_usd,
+                "gross_margin_pct": c.gross_margin_pct,
+                "mrr_usd": c.mrr_usd,
+                "avg_cost_per_subscriber_usd": c.avg_cost_per_subscriber_usd,
+                "avg_ops_per_subscriber": c.avg_ops_per_subscriber,
+            }
+            for cid, c in sorted(cohorts.items(), key=lambda x: x[1].gross_profit_usd, reverse=True)
+        }
+        console.print(json.dumps(out, indent=2))
+        return
+
+    console.print()
+    console.print("[bold]Cohort Summary[/bold]")
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+    table.add_column("Cohort", no_wrap=True)
+    table.add_column("Subs", justify="right")
+    table.add_column("Profitable", justify="right")
+    table.add_column("Revenue", justify="right")
+    table.add_column("Cost", justify="right")
+    table.add_column("Gross P/L", justify="right")
+    table.add_column("Margin", justify="right")
+    table.add_column("MRR", justify="right")
+    table.add_column("Avg cost/sub", justify="right")
+
+    for cid, c in sorted(cohorts.items(), key=lambda x: x[1].gross_profit_usd, reverse=True):
+        table.add_row(
+            cid,
+            str(c.subscriber_count),
+            f"{c.profitable_count}/{c.subscriber_count}",
+            f"${c.total_revenue_usd:.4f}",
+            f"${c.total_cost_usd:.4f}",
+            _fmt_usd(c.gross_profit_usd),
+            _fmt_margin(c.gross_margin_pct),
+            f"${c.mrr_usd:.4f}/mo",
+            f"${c.avg_cost_per_subscriber_usd:.4f}",
+        )
+    console.print(table)
+
+
+@app.command()
+def alert(
+    api_key: Annotated[str | None, typer.Option("--api-key", "-k", help="RC API key")] = None,
+    audit_db: Annotated[
+        str | None, typer.Option("--audit-db", help="Path to billing meter SQLite DB")
+    ] = None,
+    usd_per_credit: Annotated[float, typer.Option("--usd-per-credit")] = 0.001,
+    margin_floor: Annotated[
+        float, typer.Option("--margin-floor", help="Alert if gross margin below this %")
+    ] = 20.0,
+    monthly_cost_ceiling: Annotated[
+        float | None, typer.Option("--cost-ceiling", help="Alert if monthly cost exceeds this USD")
+    ] = None,
+    include_trends: Annotated[
+        bool, typer.Option("--trends/--no-trends", help="Show cost trend direction")
+    ] = True,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Flag subscribers that breach margin or cost thresholds."""
+    from .analyzer import UnitEconomicsAnalyzer
+    from .cohort import CohortAnalyzer
+    from .rc_client import RCClient
+
+    rc_api_key = _get_api_key(api_key)
+    cost_reader = _get_cost_reader(audit_db, usd_per_credit)
+    all_costs = cost_reader.load_all() if cost_reader else []
+    subscriber_ids = cost_reader.known_subscriber_ids() if cost_reader else []
+
+    if not subscriber_ids:
+        console.print("[yellow]No subscribers found in audit DB.[/yellow]")
+        raise typer.Exit(1)
+
+    async def _fetch():
+        async with RCClient(rc_api_key) as rc:
+            revenues = []
+            for sid in subscriber_ids:
+                try:
+                    revenues.append(await rc.get_subscriber_revenue(sid))
+                except Exception:
+                    pass
+            return revenues
+
+    revenues = asyncio.run(_fetch())
+    analyzer = UnitEconomicsAnalyzer()
+    portfolio = analyzer.build_portfolio(revenues, all_costs)
+    ca = CohortAnalyzer()
+    alerts = ca.find_alerts(
+        portfolio, margin_floor_pct=margin_floor, monthly_cost_ceiling_usd=monthly_cost_ceiling
+    )
+
+    if not alerts:
+        if not as_json:
+            console.print(
+                f"\n[green]✓ No alerts.[/green] All subscribers above {margin_floor:.0f}% margin floor.\n"
+            )
+        else:
+            console.print(json.dumps({"alerts": []}, indent=2))
+        return
+
+    # Compute trends for alerted subscribers if requested
+    trends: dict[str, str] = {}
+    if include_trends:
+        sub_map = {s.subscriber_id: s for s in portfolio.subscribers}
+        for a in alerts:
+            sub = sub_map.get(a.subscriber_id)
+            if sub:
+                trend = ca.compute_trend(sub)
+                trends[a.subscriber_id] = trend.slope_label
+
+    if as_json:
+        out = [
+            {
+                "subscriber_id": a.subscriber_id,
+                "severity": a.severity,
+                "reason": a.reason,
+                "gross_margin_pct": a.gross_margin_pct,
+                "monthly_cost_usd": a.monthly_cost_usd,
+                "gross_profit_usd": a.gross_profit_usd,
+                "cost_trend": trends.get(a.subscriber_id, "n/a"),
+            }
+            for a in alerts
+        ]
+        console.print(json.dumps({"alerts": out}, indent=2))
+        return
+
+    console.print(f"\n[bold]Alerts[/bold] — {len(alerts)} subscriber(s) require attention\n")
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+    table.add_column("Severity")
+    table.add_column("Subscriber", no_wrap=True)
+    table.add_column("Margin", justify="right")
+    table.add_column("Monthly cost", justify="right")
+    table.add_column("Gross P/L", justify="right")
+    if include_trends:
+        table.add_column("Cost trend")
+    table.add_column("Reason")
+
+    for a in alerts:
+        sev_label = "[red]CRITICAL[/red]" if a.severity == "critical" else "[yellow]warn[/yellow]"
+        sub_id = a.subscriber_id[:20] + "..." if len(a.subscriber_id) > 20 else a.subscriber_id
+        row = [
+            sev_label,
+            sub_id,
+            _fmt_margin(a.gross_margin_pct),
+            f"${a.monthly_cost_usd:.4f}/mo",
+            _fmt_usd(a.gross_profit_usd),
+        ]
+        if include_trends:
+            row.append(trends.get(a.subscriber_id, "—"))
+        row.append(a.reason)
+        table.add_row(*row)
+
+    console.print(table)
+    console.print()
+
+
+@app.command()
+def trend(
+    subscriber_id: str,
+    api_key: Annotated[str | None, typer.Option("--api-key", "-k")] = None,
+    audit_db: Annotated[str | None, typer.Option("--audit-db")] = None,
+    usd_per_credit: Annotated[float, typer.Option("--usd-per-credit")] = 0.001,
+    bucket_days: Annotated[int, typer.Option("--bucket-days", help="Days per time bucket")] = 7,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Show cost trend over time for a specific subscriber."""
+    from .analyzer import UnitEconomicsAnalyzer
+    from .cohort import CohortAnalyzer
+    from .rc_client import RCClient
+
+    rc_api_key = _get_api_key(api_key)
+    cost_reader = _get_cost_reader(audit_db, usd_per_credit)
+
+    async def _fetch():
+        async with RCClient(rc_api_key) as rc:
+            return await rc.get_subscriber_revenue(subscriber_id)
+
+    revenue = asyncio.run(_fetch())
+    costs = cost_reader.load_for_subscriber(subscriber_id) if cost_reader else []
+    analyzer = UnitEconomicsAnalyzer()
+    econ = analyzer.analyze_subscriber(revenue, costs)
+    ca = CohortAnalyzer()
+    t = ca.compute_trend(econ, bucket_days=bucket_days)
+
+    if as_json:
+        console.print(
+            json.dumps(
+                {
+                    "subscriber_id": t.subscriber_id,
+                    "direction": t.direction,
+                    "cost_delta_usd": t.cost_delta_usd,
+                    "at_risk": t.at_risk,
+                    "buckets": [
+                        {
+                            "period": b.period_label,
+                            "cost_usd": b.total_cost_usd,
+                            "ops": b.operation_count,
+                        }
+                        for b in t.buckets
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+
+    dir_map = {
+        "rising": "[red]↑ rising[/red]",
+        "falling": "[green]↓ falling[/green]",
+        "flat": "[blue]→ stable[/blue]",
+        "insufficient_data": "[dim]— insufficient data[/dim]",
+    }
+    console.print(f"\n[bold]Cost Trend:[/bold] {subscriber_id}")
+    console.print(f"  Direction:    {dir_map.get(t.direction, t.direction)}")
+    console.print(f"  Cost delta:   {t.slope_label}")
+    console.print(f"  At risk:      {'[red]YES[/red]' if t.at_risk else '[green]no[/green]'}")
+
+    if t.buckets:
+        console.print("\n  [bold]Buckets:[/bold]")
+        for b in t.buckets:
+            bar_len = int(b.total_cost_usd * 500)  # scale for display
+            bar = "█" * min(bar_len, 40)
+            console.print(
+                f"    {b.period_label}  {bar:<40} ${b.total_cost_usd:.6f}  ({b.operation_count} ops)"
+            )
+    console.print()
+
+
 def main() -> None:
     app()
