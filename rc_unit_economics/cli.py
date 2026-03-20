@@ -574,5 +574,176 @@ def trend(
     console.print()
 
 
+@app.command()
+def forecast(
+    subscriber_ids: Annotated[list[str] | None, typer.Argument()] = None,
+    audit_db: Annotated[
+        str | None, typer.Option("--audit-db", help="Path to billing meter SQLite DB")
+    ] = None,
+    usd_per_credit: Annotated[float, typer.Option("--usd-per-credit")] = 0.001,
+    months: Annotated[int, typer.Option("--months", help="Forecast horizon in months")] = 12,
+    scenario: Annotated[
+        str,
+        typer.Option(
+            "--scenario",
+            help="Churn scenario: optimistic | realistic | pessimistic | all",
+        ),
+    ] = "all",
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Forecast LTV for subscribers under churn scenarios."""
+    from .analyzer import UnitEconomicsAnalyzer
+    from .forecast import LTVForecaster
+
+    cost_reader = _get_cost_reader(audit_db, usd_per_credit)
+    all_costs = cost_reader.load_all() if cost_reader else []
+
+    if not subscriber_ids:
+        if cost_reader:
+            subscriber_ids = cost_reader.known_subscriber_ids()
+        if not subscriber_ids:
+            console.print("[yellow]No subscriber IDs specified and no audit DB found.[/yellow]")
+            raise typer.Exit(1)
+
+    # Build synthetic portfolio from cost data only (no RC API needed)
+    analyzer = UnitEconomicsAnalyzer()
+    portfolio = analyzer.build_portfolio([], all_costs)
+
+    # Filter to requested subscriber IDs if specified
+    if subscriber_ids:
+        sid_set = set(subscriber_ids)
+        from .models import PortfolioSummary
+
+        portfolio = PortfolioSummary(
+            subscribers=[s for s in portfolio.subscribers if s.subscriber_id in sid_set]
+        )
+
+    forecaster = LTVForecaster()
+    scenario_map = {s.label: s for s in forecaster.DEFAULT_SCENARIOS}
+
+    if scenario == "all":
+        pfs = forecaster.all_scenarios(portfolio, months=months)
+    elif scenario in scenario_map:
+        pfs = [forecaster.forecast_portfolio(portfolio, scenario_map[scenario], months=months)]
+    else:
+        console.print(
+            f"[red]Unknown scenario:[/red] {scenario}. Use optimistic, realistic, pessimistic, or all."
+        )
+        raise typer.Exit(1)
+
+    if as_json:
+        out = [
+            {
+                "scenario": pf.scenario.label,
+                "monthly_churn_rate": pf.scenario.monthly_churn_rate,
+                "months": pf.months,
+                "projected_revenue_usd": pf.projected_revenue_usd,
+                "projected_cost_usd": pf.projected_cost_usd,
+                "projected_profit_usd": pf.projected_profit_usd,
+                "expected_survivors": pf.expected_survivors,
+                "subscribers": [
+                    {
+                        "subscriber_id": sf.subscriber_id,
+                        "mrr_usd": sf.mrr_usd,
+                        "projected_ltv_usd": sf.projected_ltv_usd,
+                        "projected_cost_usd": sf.projected_cost_usd,
+                        "projected_profit_usd": sf.projected_profit_usd,
+                        "break_even_month": sf.break_even_month,
+                    }
+                    for sf in pf.subscriber_forecasts
+                ],
+            }
+            for pf in pfs
+        ]
+        console.print(json.dumps(out, indent=2))
+        return
+
+    for pf in pfs:
+        console.print(
+            f"\n[bold]{months}-Month Forecast — {pf.scenario.label}[/bold] "
+            f"({pf.scenario.monthly_churn_rate * 100:.0f}%/mo churn)"
+        )
+        table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+        table.add_column("Subscriber", no_wrap=True)
+        table.add_column("MRR", justify="right")
+        table.add_column("Proj LTV", justify="right")
+        table.add_column("Proj Cost", justify="right")
+        table.add_column("Proj Profit", justify="right")
+        table.add_column("Break-even", justify="right")
+
+        for sf in pf.subscriber_forecasts:
+            sub_id = (
+                sf.subscriber_id[:20] + "..." if len(sf.subscriber_id) > 20 else sf.subscriber_id
+            )
+            table.add_row(
+                sub_id,
+                f"${sf.mrr_usd:.4f}",
+                f"${sf.projected_ltv_usd:.4f}",
+                f"${sf.projected_cost_usd:.4f}",
+                _fmt_usd(sf.projected_profit_usd),
+                str(sf.break_even_month) if sf.break_even_month else "—",
+            )
+        console.print(table)
+        console.print(
+            f"  Portfolio: Revenue ${pf.projected_revenue_usd:.4f} | "
+            f"Cost ${pf.projected_cost_usd:.4f} | "
+            f"Profit {_fmt_usd(pf.projected_profit_usd)} | "
+            f"Survivors {pf.expected_survivors:.1f}"
+        )
+    console.print()
+
+
+@app.command()
+def report(
+    subscriber_ids: Annotated[list[str] | None, typer.Argument()] = None,
+    audit_db: Annotated[
+        str | None, typer.Option("--audit-db", help="Path to billing meter SQLite DB")
+    ] = None,
+    usd_per_credit: Annotated[float, typer.Option("--usd-per-credit")] = 0.001,
+    months: Annotated[int, typer.Option("--months", help="Forecast horizon in months")] = 12,
+    fmt: Annotated[
+        str, typer.Option("--format", help="Output format: markdown | json")
+    ] = "markdown",
+    output: Annotated[
+        str | None, typer.Option("--output", "-o", help="Write output to file")
+    ] = None,
+) -> None:
+    """Generate a full portfolio report (markdown or JSON)."""
+    from .analyzer import UnitEconomicsAnalyzer
+    from .models import PortfolioSummary
+    from .report import PortfolioReporter
+
+    cost_reader = _get_cost_reader(audit_db, usd_per_credit)
+    all_costs = cost_reader.load_all() if cost_reader else []
+
+    if not subscriber_ids:
+        if cost_reader:
+            subscriber_ids = cost_reader.known_subscriber_ids()
+
+    analyzer = UnitEconomicsAnalyzer()
+    portfolio = analyzer.build_portfolio([], all_costs)
+
+    if subscriber_ids:
+        sid_set = set(subscriber_ids)
+        portfolio = PortfolioSummary(
+            subscribers=[s for s in portfolio.subscribers if s.subscriber_id in sid_set]
+        )
+
+    reporter = PortfolioReporter(portfolio)
+
+    if fmt == "json":
+        content = reporter.as_json(months=months)
+    else:
+        content = reporter.as_markdown(months=months)
+
+    if output:
+        import pathlib
+
+        pathlib.Path(output).write_text(content, encoding="utf-8")
+        console.print(f"[green]Report written to:[/green] {output}")
+    else:
+        console.print(content)
+
+
 def main() -> None:
     app()
